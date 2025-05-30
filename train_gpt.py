@@ -13,7 +13,7 @@ from pathlib import Path
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn, autocast
+from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
@@ -308,7 +308,7 @@ class CastedLinear(nn.Linear):
             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            return F.linear(x, self.weight)
+            return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -350,7 +350,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
         q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
@@ -653,6 +653,13 @@ def get_window_size_blocks(step: int):
 
 model: nn.Module = torch.compile(model, mode="reduce-overhead", fullgraph=True, dynamic=False)
 
+def train_batch(inputs, targets, window_size_blocks):
+    torch.compiler.cudagraph_mark_step_begin()
+    model(inputs, targets, window_size_blocks).backward()
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
@@ -660,26 +667,14 @@ initial_state = dict(model=copy.deepcopy(model.state_dict()),
 train_loader = distributed_data_generator(args.train_files, world_size * args.seq_len, rank, world_size)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    torch.compiler.cudagraph_mark_step_begin()
-    with autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(inputs, targets, get_window_size_blocks(1))
-    loss.backward()
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
+    train_batch(inputs, targets, get_window_size_blocks(1))
 
 torch.cuda.synchronize()
 dist.barrier()
 with torch.profiler.profile() as prof:
     for _ in range(warmup_steps):
-        torch.compiler.cudagraph_mark_step_begin()
         inputs, targets = next(train_loader)
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss = model(inputs, targets, get_window_size_blocks(1))
-        loss.backward()
-        for opt in optimizers:
-            opt.step()
-    model.zero_grad(set_to_none=True)
+        train_batch(inputs, targets, get_window_size_blocks(1))
     torch.cuda.synchronize()
     dist.barrier()
 os.makedirs("traces", exist_ok=True)
@@ -699,7 +694,6 @@ t0 = time.perf_counter()
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    torch.compiler.cudagraph_mark_step_begin()
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
@@ -714,8 +708,7 @@ for step in range(train_steps + 1):
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    val_loss += model(inputs, targets, get_window_size_blocks(step))
+                val_loss += model(inputs, targets, get_window_size_blocks(step))
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -737,21 +730,15 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    with autocast(device_type="cuda", dtype=torch.bfloat16):
-        loss = model(inputs, targets, get_window_size_blocks(step))
-    loss.backward()
-    # set optimization hyperparameters
+
+    train_batch(inputs, targets, get_window_size_blocks(step))
+    # step the optimizers
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
     frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers and schedulers
-    for opt in optimizers:
-        opt.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
