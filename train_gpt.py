@@ -362,17 +362,16 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        std1 = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std1
-        std2 = 0.5 * ((4 * dim) ** -0.5)
-        bound2 = (3 ** 0.5) * std2
-        self.c_fc_w = nn.Parameter(torch.empty(4, dim, dim).uniform_(-bound1, bound1))
-        self.c_proj_w = nn.Parameter(torch.empty(4, dim, dim).zero_() # zero init suggested by @Grad62304977
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std
+        self.c_fc_w = nn.Parameter(torch.empty(4, dim, dim).uniform_(-bound, bound))
+        self.c_proj_w = nn.Parameter(torch.empty(4, dim, dim))
+        nn.init.zeros_(self.c_proj_w) # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
         x = F.linear(x, self.c_fc_w.flatten(end_dim=1).type_as(x))
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = F.linear(x, self.c_fc_w.flatten(end_dim=1).T.type_as(x))
+        x = F.linear(x, self.c_proj_w.flatten(end_dim=1).T.type_as(x))
         return x
 
 class Block(nn.Module):
