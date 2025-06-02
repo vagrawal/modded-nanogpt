@@ -119,8 +119,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    assert  G.size(-2) == G.size(-1)
 
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
@@ -130,8 +129,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
 
-    if G.size(-2) > G.size(-1):
-        X = X.mT
     return X.type_as(G)
 
 class Muon(torch.optim.Optimizer):
@@ -365,15 +362,17 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        hdim = 4 * dim
-        self.c_fc = CastedLinear(dim, hdim)
-        self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        std1 = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std1
+        std2 = 0.5 * ((4 * dim) ** -0.5)
+        bound2 = (3 ** 0.5) * std2
+        self.c_fc_w = nn.Parameter(torch.empty(4, dim, dim).uniform_(-bound1, bound1))
+        self.c_proj_w = nn.Parameter(torch.empty(4, dim, dim).zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x: Tensor):
-        x = self.c_fc(x)
+        x = F.linear(x, self.c_fc_w.flatten(end_dim=1).type_as(x))
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+        x = F.linear(x, self.c_fc_w.flatten(end_dim=1).T.type_as(x))
         return x
 
 class Block(nn.Module):
@@ -569,8 +568,8 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    os.makedirs("logs/orig", exist_ok=True)
-    logfile = f"logs/orig/{run_id}.txt"
+    os.makedirs("logs/splitmuon", exist_ok=True)
+    logfile = f"logs/splitmuon/{run_id}.txt"
     print(logfile)
 def print0(s, console=True):
     if master_process:
