@@ -569,8 +569,8 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 logfile = None
 if master_process:
     run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
+    os.makedirs("logs/orig", exist_ok=True)
+    logfile = f"logs/orig/{run_id}.txt"
     print(logfile)
 def print0(s, console=True):
     if master_process:
@@ -699,6 +699,7 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        torch.compiler.cudagraph_mark_step_begin()
         model.eval()
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
@@ -731,7 +732,6 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
 
-    train_batch(inputs, targets, get_window_size_blocks(step))
     # step the optimizers
     for opt in optimizers:
         for group in opt.param_groups:
@@ -739,6 +739,7 @@ for step in range(train_steps + 1):
     frac = min(step / 300, 1)
     for group in optimizer2.param_groups:
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    train_batch(inputs, targets, get_window_size_blocks(step))
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
