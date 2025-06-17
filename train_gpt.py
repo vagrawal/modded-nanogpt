@@ -105,7 +105,7 @@ mm_op.register_autograd(backward, setup_context=setup_context)
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
-@torch.compile
+@torch.compile(dynamic=False)
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
